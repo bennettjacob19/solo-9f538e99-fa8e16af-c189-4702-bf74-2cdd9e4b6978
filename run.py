@@ -1,0 +1,8 @@
+"""本地开发入口：python -I run.py"""
+
+from app.web import create_app
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, threaded=True)

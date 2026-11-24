@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>磁带灾备恢复演练</title>
+  <style>
+    :root { --ok:#1a7f37; --bad:#b42318; --warn:#b54708; --line:#d0d7de; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+           margin: 0; background:#f6f8fa; color:#1f2328; }
+    header { background:#0f2a43; color:#fff; padding:18px 28px; }
+    header h1 { margin:0 0 4px; font-size:20px; }
+    header p { margin:0; opacity:.8; font-size:13px; }
+    main { max-width:1080px; margin:24px auto; padding:0 16px; display:grid;
+           grid-template-columns: 1fr 1fr; gap:20px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:10px;
+            padding:18px; }
+    .card h2 { margin:0 0 12px; font-size:16px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+    th { color:#57606a; font-weight:600; }
+    form { font-size:13px; }
+    label { display:block; margin:10px 0 4px; font-weight:600; }
+    input, select { width:100%; padding:7px 9px; border:1px solid var(--line);
+                    border-radius:6px; font-size:13px; }
+    button { margin-top:14px; background:#0f2a43; color:#fff; border:0;
+             border-radius:6px; padding:9px 18px; font-size:14px; cursor:pointer; }
+    button:disabled { background:#8c99a6; cursor:not-allowed; }
+    .hint { color:#57606a; font-size:12px; margin-top:6px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px;
+            font-size:12px; font-weight:600; }
+    .pill.ok { background:#dafbe1; color:var(--ok); }
+    .pill.bad { background:#ffebe9; color:var(--bad); }
+    .pill.run { background:#fff8c5; color:var(--warn); }
+    .pill.none { background:#eaeef2; color:#57606a; }
+    .metrics { display:flex; gap:12px; flex-wrap:wrap; margin:10px 0; }
+    .metric { background:#f6f8fa; border:1px solid var(--line); border-radius:8px;
+              padding:10px 14px; min-width:120px; }
+    .metric b { display:block; font-size:20px; }
+    .metric span { font-size:12px; color:#57606a; }
+    pre { background:#0d1117; color:#c9d1d9; padding:12px; border-radius:8px;
+          font-size:12px; max-height:260px; overflow:auto; white-space:pre-wrap; }
+    a.dl { font-size:12px; color:#0969da; text-decoration:none; }
+    a.dl:hover { text-decoration:underline; }
+    .full { grid-column: 1 / -1; }
+    .err { background:#ffebe9; border:1px solid #ffabaf; color:var(--bad);
+           padding:10px 12px; border-radius:8px; font-size:13px; margin:8px 0; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>磁带灾备恢复演练（单机两带 · 4 KiB 镜像块）</h1>
+  <p>换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块写出前核对 SHA-256；坏块或额度不足即失败并保留上次成品。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 选择本地带卷</h2>
+    <table>
+      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>预估读带/暂存</th><th>上次成品</th><th></th></tr></thead>
+      <tbody>
+      {% for s in sets %}
+        <tr>
+          <td><code>{{ s.name }}</code></td>
+          <td>{{ s.tape_count }}</td>
+          <td>{{ s.block_count }}</td>
+          <td>{{ s.estimate.blocks_read }} / {{ s.estimate.staging_peak }} 块</td>
+          <td>
+            {% if s.has_artifact %}
+              <span class="pill ok">{{ s.artifact_size }} B</span>
+            {% else %}
+              <span class="pill none">无</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if s.has_artifact %}
+              <a class="dl" href="{{ url_for('download', set_name=s.name) }}">下载成品</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6">未发现任何合法带卷，请先生成样例。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="hint">预估值按“提前读到的块全部暂存”的贪心策略计算，是该布局下的额度下限。</p>
+  </section>
+
+  <section class="card">
+    <h2>2. 填写额度并启动恢复</h2>
+    <form method="post" action="{{ url_for('recover') }}">
+      <label for="set_name">带卷</label>
+      <select id="set_name" name="set_name" required {% if job.running %}disabled{% endif %}>
+        {% for s in sets %}
+          <option value="{{ s.name }}" {% if job.set_name == s.name %}selected{% endif %}>
+            {{ s.name }}（{{ s.block_count }} 块 / {{ s.tape_count }} 带）
+          </option>
+        {% endfor %}
+      </select>
+      <label for="read_quota">读带块数上限（含跳过与重读）</label>
+      <input id="read_quota" name="read_quota" type="number" min="1" max="100000"
+             value="{{ job.read_quota or 40 }}" required {% if job.running %}disabled{% endif %}>
+      <label for="staging_quota">暂存块数上限（提前读到的块）</label>
+      <input id="staging_quota" name="staging_quota" type="number" min="0" max="12"
+             value="{{ job.staging_quota or 12 }}" required {% if job.running %}disabled{% endif %}>
+      <button type="submit" {% if job.running or not sets %}disabled{% endif %}>开始恢复演练</button>
+      <p class="hint">恢复期间页面每 1 秒自动刷新任务状态，下载上次成品不受影响。</p>
+    </form>
+  </section>
+
+  <section class="card full">
+    <h2>3. 任务状态与实际用量
+      {% if job.running %}
+        <span class="pill run">运行中 · {{ job.set_name }}</span>
+      {% elif job.result %}
+        {% if job.result.success %}
+          <span class="pill ok">成功 · {{ job.set_name }}</span>
+        {% else %}
+          <span class="pill bad">失败 · {{ job.set_name }}</span>
+        {% endif %}
+      {% else %}
+        <span class="pill none">暂无任务</span>
+      {% endif %}
+    </h2>
+
+    {% if job.error %}
+      <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
+    {% endif %}
+
+    {% if job.result %}
+    <div class="metrics">
+      <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>实际读带块数</span></div>
+      <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
+      <div class="metric"><b>{{ job.result.blocks_written }}</b><span>已写入镜像块</span></div>
+      <div class="metric"><b>{{ job.result.metrics.tape_switches }}</b><span>换带次数</span></div>
+      <div class="metric"><b>{{ job.result.metrics.rewinds }}</b><span>回卷次数</span></div>
+      <div class="metric"><b>{{ job.result.metrics.tape_mounts }}</b><span>挂带次数</span></div>
+    </div>
+    {% if job.result.success and job.set_name %}
+      <p><a class="dl" href="{{ url_for('download', set_name=job.set_name) }}">下载本次交付的完整镜像 →</a></p>
+    {% endif %}
+    {% endif %}
+
+    <h2 style="font-size:14px;margin-top:14px">事件流</h2>
+    <pre id="events">{% for e in job.events %}{{ e }}
+{% endfor %}</pre>
+  </section>
+</main>
+<script>
+  let pollTimer = null;
+  async function poll() {
+    const resp = await fetch("{{ url_for('status') }}");
+    const job = await resp.json();
+    const pre = document.getElementById("events");
+    pre.textContent = (job.events || []).join("\n");
+    if (!job.running) {
+      clearInterval(pollTimer);
+      setTimeout(() => window.location.reload(), 1200);
+    }
+  }
+  if (document.querySelector(".pill.run")) {
+    pollTimer = setInterval(poll, 1000);
+  }
+</script>
+</body>
+</html>
