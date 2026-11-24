@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>磁带灾备恢复演练</title>
+  <title>磁带巡检与灾备恢复演练</title>
   <style>
     :root { --ok:#1a7f37; --bad:#b42318; --warn:#b54708; --line:#d0d7de; }
     * { box-sizing: border-box; }
@@ -27,6 +27,7 @@
     button { margin-top:14px; background:#0f2a43; color:#fff; border:0;
              border-radius:6px; padding:9px 18px; font-size:14px; cursor:pointer; }
     button:disabled { background:#8c99a6; cursor:not-allowed; }
+    button.alt { background:#0b5d3b; }
     .hint { color:#57606a; font-size:12px; margin-top:6px; }
     .pill { display:inline-block; padding:2px 8px; border-radius:999px;
             font-size:12px; font-weight:600; }
@@ -46,18 +47,21 @@
     .full { grid-column: 1 / -1; }
     .err { background:#ffebe9; border:1px solid #ffabaf; color:var(--bad);
            padding:10px 12px; border-radius:8px; font-size:13px; margin:8px 0; }
+    .note { background:#fff8c5; border:1px solid #eed888; color:#7a4d00;
+            padding:10px 12px; border-radius:8px; font-size:13px; margin:8px 0; }
+    code { font-size:12px; }
   </style>
 </head>
 <body>
 <header>
-  <h1>磁带灾备恢复演练（单机两带 · 4 KiB 镜像块）</h1>
-  <p>换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块写出前核对 SHA-256；坏块或额度不足即失败并保留上次成品。</p>
+  <h1>磁带巡检与灾备恢复演练（单机两带 · 4 KiB 帧）</h1>
+  <p>巡检按带号顺读、逐帧核对清单 SHA-256；巡检与恢复共用带机，每轮巡检只接一次恢复插队，收到请求后读完当前帧最多再读两帧即让位；恢复实读并核验通过的帧计入同套带卷巡检。</p>
 </header>
 <main>
-  <section class="card">
+  <section class="card full">
     <h2>1. 选择本地带卷</h2>
     <table>
-      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>预估读带/暂存</th><th>上次成品</th><th></th></tr></thead>
+      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>恢复预估读带/暂存</th><th>上次成品</th><th></th></tr></thead>
       <tbody>
       {% for s in sets %}
         <tr>
@@ -83,14 +87,36 @@
       {% endfor %}
       </tbody>
     </table>
-    <p class="hint">预估值按“提前读到的块全部暂存”的贪心策略计算，是该布局下的额度下限。</p>
+    <p class="hint">恢复预估值按“提前读到的块全部暂存”的贪心策略计算，是该布局下的恢复额度下限。</p>
   </section>
 
   <section class="card">
-    <h2>2. 填写额度并启动恢复</h2>
+    <h2>2. 巡检带卷</h2>
+    <form method="post" action="{{ url_for('inspect_view') }}">
+      <label for="inspect_set">带卷</label>
+      <select id="inspect_set" name="set_name" required {% if job.running %}disabled{% endif %}>
+        {% for s in sets %}
+          <option value="{{ s.name }}" {% if job.set_name == s.name %}selected{% endif %}>
+            {{ s.name }}（{{ s.block_count }} 块 / {{ s.tape_count }} 带）
+          </option>
+        {% endfor %}
+      </select>
+      <label for="inspection_quota">巡检最多读多少帧</label>
+      <input id="inspection_quota" name="inspection_quota" type="number" min="1"
+             max="100000" value="{{ job.inspection_quota or 24 }}" required
+             {% if job.running %}disabled{% endif %}>
+      <button class="alt" type="submit" {% if job.running or not sets %}disabled{% endif %}>
+        开始巡检
+      </button>
+      <p class="hint">巡检从带号 0 的带头开始顺读，每帧按清单核对 SHA-256；经过的帧（含已核验帧）都计入巡检实读帧数。</p>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>3. 恢复带卷</h2>
     <form method="post" action="{{ url_for('recover') }}">
       <label for="set_name">带卷</label>
-      <select id="set_name" name="set_name" required {% if job.running %}disabled{% endif %}>
+      <select id="set_name" name="set_name" required {% if job.running and job.kind != 'inspection' %}disabled{% endif %}>
         {% for s in sets %}
           <option value="{{ s.name }}" {% if job.set_name == s.name %}selected{% endif %}>
             {{ s.name }}（{{ s.block_count }} 块 / {{ s.tape_count }} 带）
@@ -99,24 +125,46 @@
       </select>
       <label for="read_quota">读带块数上限（含跳过与重读）</label>
       <input id="read_quota" name="read_quota" type="number" min="1" max="100000"
-             value="{{ job.read_quota or 40 }}" required {% if job.running %}disabled{% endif %}>
+             value="{{ job.read_quota or 40 }}" required
+             {% if job.running and job.kind != 'inspection' %}disabled{% endif %}>
       <label for="staging_quota">暂存块数上限（提前读到的块）</label>
       <input id="staging_quota" name="staging_quota" type="number" min="0" max="12"
-             value="{{ job.staging_quota or 12 }}" required {% if job.running %}disabled{% endif %}>
-      <button type="submit" {% if job.running or not sets %}disabled{% endif %}>开始恢复演练</button>
-      <p class="hint">恢复期间页面每 1 秒自动刷新任务状态，下载上次成品不受影响。</p>
+             value="{{ job.staging_quota or 12 }}" required
+             {% if job.running and job.kind != 'inspection' %}disabled{% endif %}>
+      <button type="submit" {% if job.running and job.kind != 'inspection' %}disabled{% endif %}>
+        {% if job.running and job.kind == 'inspection' %}提交恢复插队{% else %}开始恢复演练{% endif %}
+      </button>
+      <p class="hint">
+        巡检运行中提交恢复即为一次插队：本轮巡检只接受一次，巡检读完当前帧最多再读两帧就让位；恢复照所填额度执行。
+        无巡检运行时按普通恢复执行，成功后原子发布成品，失败保留上次成品。
+      </p>
     </form>
+    {% if job.pending_recovery %}
+      <div class="note">已有一笔恢复插队请求在排队，等待巡检帧边界让位；本轮巡检不再接受第二次插队。</div>
+    {% endif %}
   </section>
 
   <section class="card full">
-    <h2>3. 任务状态与实际用量
-      {% if job.running %}
-        <span class="pill run">运行中 · {{ job.set_name }}</span>
+    <h2>4. 任务状态
+      {% if job.running and job.kind == 'inspection' %}
+        <span class="pill run">巡检中 · {{ job.set_name }}</span>
+      {% elif job.running %}
+        <span class="pill run">恢复中 · {{ job.set_name }}</span>
+      {% elif job.inspection %}
+        {% if job.inspection.complete %}
+          <span class="pill ok">巡检通过 · {{ job.inspection.set_name }}</span>
+        {% elif job.inspection.status == 'bad_block' %}
+          <span class="pill bad">巡检发现坏块 · {{ job.inspection.set_name }}</span>
+        {% elif job.inspection.status == 'quota_exceeded' %}
+          <span class="pill bad">巡检额度不足 · {{ job.inspection.set_name }}</span>
+        {% else %}
+          <span class="pill bad">巡检异常 · {{ job.inspection.set_name }}</span>
+        {% endif %}
       {% elif job.result %}
         {% if job.result.success %}
-          <span class="pill ok">成功 · {{ job.set_name }}</span>
+          <span class="pill ok">恢复成功 · {{ job.set_name }}</span>
         {% else %}
-          <span class="pill bad">失败 · {{ job.set_name }}</span>
+          <span class="pill bad">恢复失败 · {{ job.set_name }}</span>
         {% endif %}
       {% else %}
         <span class="pill none">暂无任务</span>
@@ -124,21 +172,66 @@
     </h2>
 
     {% if job.error %}
-      <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
+      <div class="err">错误：{{ job.error }}</div>
+    {% endif %}
+
+    {% set insp = job.inspection %}
+    {% if job.running and job.kind == 'inspection' %}
+      <div class="metrics">
+        <div class="metric"><b>{{ job.inspection_progress }}</b><span>巡检已实读帧数（上限 {{ job.inspection_quota }}）</span></div>
+        <div class="metric"><b>{{ job.inspection_quota }}</b><span>巡检帧额度</span></div>
+      </div>
+    {% elif insp %}
+      <div class="metrics">
+        <div class="metric"><b>{{ insp.frames_read }}</b><span>巡检实读帧数（含已核验帧，上限 {{ insp.quota }}）</span></div>
+        <div class="metric"><b>{{ insp.supplied_count }}</b><span>由恢复补齐的帧</span></div>
+        <div class="metric"><b>{{ insp.total_verified }}/{{ insp.block_count }}</b><span>已核验 / 总帧数</span></div>
+        <div class="metric"><b>{{ insp.verified_by_inspection|length }}</b><span>巡检亲自核验的帧</span></div>
+        <div class="metric"><b>{{ insp.jumps|length }}</b><span>让位给恢复的次数</span></div>
+      </div>
+      {% if insp.status == 'complete' %}
+        <div class="notice ok" style="color:var(--ok);font-size:13px;margin:8px 0">
+          全部 {{ insp.block_count }} 帧核验通过，巡检完成。
+        </div>
+      {% elif insp.status == 'bad_block' %}
+        <div class="err">
+          巡检发现坏块：{{ insp.bad_block_text }}。
+          {% if insp.bad_block %}
+            （镜像块 {{ insp.bad_block.index }}，磁带 tape{{ insp.bad_block.tape }}，帧位置 {{ insp.bad_block.position }}）
+          {% endif %}
+        </div>
+      {% elif insp.status == 'quota_exceeded' %}
+        <div class="err">巡检额度不足：{{ insp.error }}</div>
+      {% endif %}
+
+      {% if insp.supplied_by_recovery %}
+        <p class="hint">由恢复补齐的镜像块：{{ insp.supplied_by_recovery|join(', ') }}</p>
+      {% else %}
+        <p class="hint">本次巡检没有需要由恢复补齐的帧。</p>
+      {% endif %}
+      {% if insp.jumps %}
+        <p class="hint">
+          {% for j in insp.jumps %}
+            第 {{ loop.index }} 次让位：请求时巡检已实读 {{ j.frames_at_request }} 帧，
+            让位时 {{ j.frames_at_yield }} 帧（请求后多读 {{ j.extra_frames_after_request }} 帧）。
+          {% endfor %}
+        </p>
+      {% endif %}
     {% endif %}
 
     {% if job.result %}
-    <div class="metrics">
-      <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>实际读带块数</span></div>
-      <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
-      <div class="metric"><b>{{ job.result.blocks_written }}</b><span>已写入镜像块</span></div>
-      <div class="metric"><b>{{ job.result.metrics.tape_switches }}</b><span>换带次数</span></div>
-      <div class="metric"><b>{{ job.result.metrics.rewinds }}</b><span>回卷次数</span></div>
-      <div class="metric"><b>{{ job.result.metrics.tape_mounts }}</b><span>挂带次数</span></div>
-    </div>
-    {% if job.result.success and job.set_name %}
-      <p><a class="dl" href="{{ url_for('download', set_name=job.set_name) }}">下载本次交付的完整镜像 →</a></p>
-    {% endif %}
+      <h2 style="font-size:14px;margin-top:14px">最近一次恢复</h2>
+      <div class="metrics">
+        <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>恢复实际读带块数</span></div>
+        <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
+        <div class="metric"><b>{{ job.result.blocks_written }}</b><span>已写入镜像块</span></div>
+        <div class="metric"><b>{{ job.result.metrics.tape_switches }}</b><span>换带次数</span></div>
+        <div class="metric"><b>{{ job.result.metrics.rewinds }}</b><span>回卷次数</span></div>
+        <div class="metric"><b>{{ job.result.metrics.verified_blocks|length }}</b><span>恢复核验通过帧数</span></div>
+      </div>
+      {% if job.result.success and job.result.set_name %}
+        <p><a class="dl" href="{{ url_for('download', set_name=job.result.set_name) }}">下载本次交付的完整镜像 →</a></p>
+      {% endif %}
     {% endif %}
 
     <h2 style="font-size:14px;margin-top:14px">事件流</h2>

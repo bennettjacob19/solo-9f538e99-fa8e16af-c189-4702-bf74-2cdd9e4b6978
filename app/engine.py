@@ -9,6 +9,8 @@
 * 镜像只允许按块号 0、1、2…… 追加，不能回读、不能改前面的块。
 * 每个块在写出前都要再核对一次 SHA-256；坏块或任一额度不足立即失败，
   失败时不产出新镜像（由上层保留上一次成品）。
+* 引擎额外记录“实读并核验通过的镜像块”，供带卷巡检把恢复读过的帧计入巡检；
+  恢复中途失败时，失败前已核验的帧同样保留在记录里。
 """
 
 from __future__ import annotations
@@ -96,7 +98,12 @@ class RecoveryMetrics:
     tape_switches: int = 0         # 在两盘带之间切换的次数
     rewinds: int = 0               # 同一盘带回卷次数
     bad_block: int | None = None   # 命中的坏块号（若有）
+    bad_block_tape: int | None = None      # 坏块所在磁带号
+    bad_block_position: int | None = None  # 坏块在带上的帧位置
     head_position: int = 0         # 当前磁头：本盘带上“下一个待读帧”的序号
+    # 本次恢复“实际读到并核验通过”的镜像块号（去重）。
+    # 巡检会把这些帧视为已核验，因此恢复中途失败也照算。
+    verified_blocks: list[int] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
 
     def log(self, message: str) -> None:
@@ -210,6 +217,12 @@ def simulate_recovery(
     head_position = 0          # 当前磁头：本盘带上“下一个待读帧”的序号
     n = tape_set.block_count
     written = 0
+    verified: set[int] = set()
+
+    def mark_verified(index: int) -> None:
+        if index not in verified:
+            verified.add(index)
+            metrics.verified_blocks.append(index)
 
     def drain_staged() -> None:
         nonlocal written
@@ -273,10 +286,13 @@ def simulate_recovery(
                 # 入暂存前先核对摘要，坏块立即失败。
                 if sha256_hex(data) != frame_entry.sha256:
                     metrics.bad_block = frame_entry.index
+                    metrics.bad_block_tape = current_tape
+                    metrics.bad_block_position = position
                     raise BadBlock(
                         f"坏块：镜像块 {frame_entry.index}（tape{current_tape} "
                         f"位置 {position}）SHA-256 核对失败"
                     )
+                mark_verified(frame_entry.index)
 
                 if frame_entry.index == target:
                     # 正好是当前需要的块：摘要已在上面核对，直接追加，不占暂存。

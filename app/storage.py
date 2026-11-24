@@ -58,9 +58,17 @@ class TapeSet:
     def entry(self, index: int) -> BlockEntry:
         return self._by_index[index]
 
+    def entry_at(self, tape: int, position: int) -> BlockEntry:
+        """返回某盘带某帧位置上的清单记录。"""
+
+        return self._by_location[(tape, position)]
+
     def __post_init__(self) -> None:
         by_index = {b.index: b for b in self.blocks}
         object.__setattr__(self, "_by_index", by_index)
+        object.__setattr__(
+            self, "_by_location", {(b.tape, b.position): b for b in self.blocks}
+        )
 
 
 def _validate_manifest(raw: object) -> tuple[list[dict], list[str]]:
